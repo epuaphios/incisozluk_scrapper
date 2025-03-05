@@ -1,0 +1,1 @@
+# incisozluk_scrapper
