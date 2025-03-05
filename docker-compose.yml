@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:latest
+    container_name: incisozluk-mongo
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: sifre123
+      MONGO_INITDB_DATABASE: incisozluk
+    ports:
+      - "27017:27017"
+    volumes:
+      - /media/ogn/data/mongo-data:/data/db
+      - /media/ogn/data/mongo-init:/docker-entrypoint-initdb.d
+    command: [--wiredTigerCacheSizeGB=4] # RAM'de 1GB cache kullan (sunucu boyutuna göre ayarla)
