@@ -6,6 +6,8 @@ from pymongo import MongoClient
 import time
 import random
 from datetime import datetime
+import unicodedata
+import re
 
 # MongoDB Ayarları
 MONGO_URI = "mongodb://scraper:scraper123@localhost:27017/incisozluk?authSource=incisozluk"
@@ -13,10 +15,10 @@ DB_NAME = "incisozluk"
 COLLECTION_NAME = "entries"
 
 # Scraper Ayarları
-THREAD_COUNT = 3
-START_ID = 208028525
-END_ID = 208028525  # Tek entry testi
-REQUEST_DELAY = 1
+THREAD_COUNT = 8
+START_ID = 1122443
+END_ID = 1122443
+REQUEST_DELAY = 1.2
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15'
@@ -28,111 +30,169 @@ db = client[DB_NAME]
 collection = db[COLLECTION_NAME]
 
 task_queue = queue.Queue()
+wiki_data = {}
+lock = threading.Lock()
 
-def parse_single_entry(entry_tag, is_main_entry=False):
-    # Ortak Parsing
-    entry_text = entry_tag.find('div', class_='entry-text-wrap').text.strip()
+def clean_text(text):
+    """Gelişmiş metin temizleme ve normalizasyon"""
+    text = unicodedata.normalize('NFKC', str(text))
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
 
-    author_tag = entry_tag.find('a', class_='username')
-    author_name = author_tag.text.strip() if author_tag else None
-    author_profile = author_tag['href'] if author_tag else None
+def baslik_to_slug(baslik):
+    """Başlıktan slug oluşturma"""
+    baslik = baslik.lower()
+    baslik = re.sub(r'[^a-z0-9 ğüşıöç]', '', baslik)
+    baslik = baslik.replace(' ', '-')
+    baslik = unicodedata.normalize('NFKD', baslik).encode('ascii', 'ignore').decode('ascii')
+    return baslik
 
-    date_tag = entry_tag.find('a', class_='entry-tarih')
-    raw_date = date_tag.get('title') if date_tag else ""
-
+def parse_wiki(slug):
+    """Wiki sayfasından başlık ve ilk entry'i çekme"""
     try:
-        parsed_date = datetime.strptime(raw_date, "%d-%m-%Y %H:%M").isoformat()
-    except:
-        parsed_date = datetime.now().isoformat()
+        url = f"https://incisozluk.co/w/{slug}"
+        response = requests.get(url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=20)
 
-    # Oy Sayıları
-    upvote = entry_tag.find('span', class_='puan_suku')
-    downvote = entry_tag.find('span', class_='puan_cuku')
+        if response.status_code != 200:
+            return None
 
-    data = {
-        "entry": entry_text,
-        "yazar": {
-            "username": author_name,
-            "profile": author_profile
-        },
-        "tarih": parsed_date,
-        "oy": {
-            "artı": upvote.find('strong').text.strip() if upvote and upvote.find('strong') else "0",
-            "eksi": downvote.find('strong').text.strip() if downvote and downvote.find('strong') else "0"
+        soup = BeautifulSoup(response.content, 'lxml')
+
+        # Başlık ve ilk entry
+        baslik = clean_text(soup.find('h1', {'class': 'title'}).text)
+        first_entry = soup.find('li', {'class': 'entry'})
+
+        # Entry detayları
+        entry_text = clean_text(first_entry.find('div', {'class': 'entry-text-wrap'}).text)
+        entry_id = int(re.search(r'/e/(\d+)', first_entry.find('a', {'class': 'entry-tarih'})['href']).group(1))
+
+        # Oy bilgileri
+        votes = {
+            "artı": clean_text(first_entry.find('span', {'class': 'puan_suku'}).text),
+            "eksi": clean_text(first_entry.find('span', {'class': 'puan_cuku'}).text)
         }
-    }
 
-    # Sadece ana entry'de başlık
-    if is_main_entry:
-        data["baslik"] = entry_tag.find_previous('h1', class_='title').text.strip()
+        return {
+            "baslik": baslik,
+            "entry_id": entry_id,
+            "entry": entry_text,
+            "oy": votes
+        }
 
-    return data
-
-def parse_html(html, entry_id):
-    soup = BeautifulSoup(html, 'lxml')
-
-    # Ana Entry
-    main_entry = soup.find('li', class_='entry')
-    if not main_entry:
+    except Exception as e:
+        print(f"Wiki hatası ({slug}): {str(e)}")
         return None
 
-    data = parse_single_entry(main_entry, is_main_entry=True)
-    data['entry_id'] = entry_id
+def parse_entry(entry_id):
+    """Normal entry sayfasını parse etme"""
+    try:
+        url = f"https://incisozluk.co/e/{entry_id}"
+        response = requests.get(url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=20)
 
-    # Cevaplar
-    replies = []
-    reply_section = main_entry.find_next_sibling('li', class_='replay')
-    if reply_section:
-        for reply in reply_section.find_all('li', class_='entry'):
-            reply_data = parse_single_entry(reply)
-            replies.append(reply_data)
+        if response.status_code != 200:
+            return None
 
-    data['cevaplar'] = replies
-    return data
+        soup = BeautifulSoup(response.content, 'lxml')
+
+        # Temel bilgiler
+        baslik = clean_text(soup.find('h1', {'class': 'title'}).text)
+        main_entry = soup.find('li', {'class': 'entry'})
+
+        # Ana entry detayları
+        entry_text = clean_text(main_entry.find('div', {'class': 'entry-text-wrap'}).text)
+        tarih = datetime.strptime(main_entry.find('a', {'class': 'entry-tarih'})['title'], "%d-%m-%Y %H:%M")
+
+        # Oy bilgileri
+        votes = {
+            "artı": clean_text(main_entry.find('span', {'class': 'puan_suku'}).text),
+            "eksi": clean_text(main_entry.find('span', {'class': 'puan_cuku'}).text)
+        }
+
+        # Cevaplar
+        cevaplar = []
+        reply_section = main_entry.find_next_sibling('li', {'class': 'replay'})
+        if reply_section:
+            for reply in reply_section.find_all('li', {'class': 'entry'}):
+                reply_text = clean_text(reply.find('div', {'class': 'entry-text-wrap'}).text)
+                reply_votes = {
+                    "artı": clean_text(reply.find('span', {'class': 'puan_suku'}).text),
+                    "eksi": clean_text(reply.find('span', {'class': 'puan_cuku'}).text)
+                }
+                cevaplar.append({
+                    "entry": reply_text,
+                    "oy": reply_votes
+                })
+
+        return {
+            "entry_id": entry_id,
+            "baslik": baslik,
+            "entry": entry_text,
+            "tarih": tarih.isoformat(),
+            "entry_oy": votes,
+            "entry_cevaplar": cevaplar
+        }
+
+    except Exception as e:
+        print(f"Entry hatası (#{entry_id}): {str(e)}")
+        return None
 
 def worker():
     while True:
-        entry_id = task_queue.get()
+        task = task_queue.get()
 
         try:
-            headers = {'User-Agent': random.choice(USER_AGENTS)}
-            time.sleep(REQUEST_DELAY * random.uniform(0.8, 1.2))
+            # Wiki işleme
+            if isinstance(task, str):
+                wiki_result = parse_wiki(task)
+                if wiki_result:
+                    with lock:
+                        slug = baslik_to_slug(wiki_result['baslik'])
+                        wiki_data[slug] = {
+                            "baslik": wiki_result['baslik'],
+                            "entry": wiki_result['entry'],
+                            "oy": wiki_result['oy']
+                        }
+                    print(f"📖 Wiki kaydedildi: {wiki_result['baslik']}")
 
-            url = f"https://incisozluk.co/e/{entry_id}"
-            response = requests.get(url, headers=headers, timeout=15)
+            # Normal entry işleme
+            elif isinstance(task, int):
+                time.sleep(REQUEST_DELAY * random.uniform(0.9, 1.1))
+                entry_data = parse_entry(task)
 
-            if response.status_code == 200:
-                data = parse_html(response.text, entry_id)
-                if data:
+                if entry_data:
+                    # Wiki verilerini entegre et
+                    slug = baslik_to_slug(entry_data['baslik'])
+                    with lock:
+                        if slug in wiki_data:
+                            entry_data["baslik_ilk_yorum"] = {
+                                "entry": wiki_data[slug]['entry'],
+                                "oy": wiki_data[slug]['oy']
+                            }
+
+                    # MongoDB'ye kaydet
                     collection.update_one(
-                        {"entry_id": entry_id},
-                        {"$set": data},
+                        {"entry_id": entry_data['entry_id']},
+                        {"$set": entry_data},
                         upsert=True
                     )
-                    print(f"✅ #{entry_id} kaydedildi - {len(data['cevaplar'])} cevap")
-                else:
-                    print(f"⚠️ #{entry_id} geçersiz HTML yapısı")
-
-            elif response.status_code == 404:
-                print(f"⏩ #{entry_id} bulunamadı")
-            else:
-                print(f"⚠️ #{entry_id} hata kodu: {response.status_code}")
+                    print(f"✅ #{entry_data['entry_id']} kaydedildi")
 
         except Exception as e:
-            print(f"🔥 #{entry_id} hata: {str(e)}")
+            print(f"🔥 Kritik hata: {str(e)}")
 
         finally:
             task_queue.task_done()
 
-# Thread'leri Başlat
+# Thread'leri başlat
 for _ in range(THREAD_COUNT):
     threading.Thread(target=worker, daemon=True).start()
 
-# Queue'yu Doldur
+
+# Normal entry'leri ekle
 for entry_id in range(START_ID, END_ID + 1):
     task_queue.put(entry_id)
 
-# Bekleme ve Temizlik
+# İşlemleri bekle
 task_queue.join()
 client.close()
-print("🎉 İşlem tamamlandı!")
+print("🎉 Tüm veriler başarıyla kaydedildi!")
