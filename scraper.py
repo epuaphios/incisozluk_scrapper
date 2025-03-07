@@ -14,10 +14,11 @@ DB_NAME = "incisozluk"
 COLLECTION_NAME = "entries"
 
 # Scraper Ayarları
-THREAD_COUNT = 10
-START_ID = 100102
-END_ID = 100102
+THREAD_COUNT = 20
+START_ID = 257245
+END_ID = 2000000
 REQUEST_DELAY = 1
+MAX_RETRIES = 10
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15'
@@ -54,7 +55,6 @@ def parse_html(html, entry_id):
     try:
         soup = BeautifulSoup(html.decode('utf-8', 'ignore'), 'lxml')
 
-        # Başlık ve wiki slug'ını çek
         title_tag = soup.find('h1', class_='title')
         baslik = ""
         wiki_slug = ""
@@ -64,12 +64,10 @@ def parse_html(html, entry_id):
                 wiki_slug = title_link.get('href', '').split('/w/')[-1].strip('/')
                 baslik = clean_text(title_link.get_text())
 
-        # Ana entry verileri
         main_entry = soup.find('li', class_='entry')
         if not main_entry:
             return None
 
-        # Tarih işleme
         date_tag = main_entry.find('a', class_='entry-tarih')
         raw_date = date_tag.get('title', '') if date_tag else ""
         try:
@@ -77,11 +75,9 @@ def parse_html(html, entry_id):
         except:
             parsed_date = datetime.now().isoformat()
 
-        # Oy bilgileri
         upvote = main_entry.find('span', class_='puan_suku')
         downvote = main_entry.find('span', class_='puan_cuku')
 
-        # Başlığın ilk yorumunu çek
         baslik_ilk_yorum = get_wiki_first_comment(wiki_slug) if wiki_slug else ""
 
         data = {
@@ -97,7 +93,6 @@ def parse_html(html, entry_id):
             "entry_cevaplar": []
         }
 
-        # Cevapları işle
         reply_section = main_entry.find_next_sibling('li', class_='replay')
         if reply_section:
             for reply in reply_section.find_all('li', class_='entry'):
@@ -122,33 +117,53 @@ def parse_html(html, entry_id):
 def worker():
     while True:
         entry_id = task_queue.get()
+        retry_count = 0
+        success = False
 
-        try:
-            headers = {'User-Agent': random.choice(USER_AGENTS)}
-            time.sleep(REQUEST_DELAY * random.uniform(0.8, 1.2))
+        while retry_count < MAX_RETRIES and not success:
+            try:
+                headers = {'User-Agent': random.choice(USER_AGENTS)}
+                delay = REQUEST_DELAY * random.uniform(0.8, 1.2)
+                time.sleep(delay)
 
-            url = f"https://incisozluk.co/e/{entry_id}"
-            response = requests.get(url, headers=headers, timeout=15)
+                url = f"https://incisozluk.co/e/{entry_id}"
+                response = requests.get(url, headers=headers, timeout=15)
 
-            if response.status_code == 200:
-                data = parse_html(response.content, entry_id)
-                if data:
-                    collection.update_one(
-                        {"entry_id": entry_id},
-                        {"$set": data},
-                        upsert=True
-                    )
-                    print(f"✅ #{entry_id} kaydedildi - İlk yorum: {data['baslik_ilk_yorum'][:30]}...")
+                if response.status_code == 200:
+                    try:
+                        data = parse_html(response.content, entry_id)
+                    except Exception as e:
+                        print(f"⚠️ #{entry_id} ayrıştırma hatası: {str(e)}")
+                        data = None
 
-            elif response.status_code == 404:
-                print(f"⏩ #{entry_id} bulunamadı")
-            else:
-                print(f"⚠️ #{entry_id} hata: {response.status_code}")
+                    if data:
+                        collection.update_one(
+                            {"entry_id": entry_id},
+                            {"$set": data},
+                            upsert=True
+                        )
+                        print(f"✅ #{entry_id} kaydedildi - İlk yorum: {data['baslik_ilk_yorum'][:30]}...")
+                    success = True
+                elif response.status_code == 404:
+                    print(f"⏩ #{entry_id} bulunamadı")
+                    success = True
+                else:
+                    print(f"⚠️ #{entry_id} hata: {response.status_code}, yeniden deneme {retry_count + 1}/{MAX_RETRIES}")
+                    retry_count += 1
 
-        except Exception as e:
-            print(f"🔥 #{entry_id} hata: {str(e)}")
-        finally:
-            task_queue.task_done()
+            except Exception as e:
+                print(f"🔥 #{entry_id} hata: {str(e)}, yeniden deneme {retry_count + 1}/{MAX_RETRIES}")
+                retry_count += 1
+
+            if not success and retry_count < MAX_RETRIES:
+                backoff = 5 * retry_count
+                time.sleep(backoff)
+
+        if not success:
+            print(f"🚨 #{entry_id} 10 kez denenmesine rağmen alınamadı. 10 dakika bekleniyor...")
+            time.sleep(600)
+
+        task_queue.task_done()
 
 # Thread'leri Başlat
 for _ in range(THREAD_COUNT):
