@@ -18,7 +18,7 @@ COLLECTION_NAME = "entries"
 
 CONCURRENT_TASKS = 250  # Eşzamanlı request sayısı
 REQUEST_TIMEOUT = 25
-MAX_RETRIES = 5
+MAX_RETRIES = 15
 BASE_DELAY = 0.3
 ENTRY_START = 428522
 ENTRY_END = 2000000
@@ -137,36 +137,45 @@ class InciScraper:
 
     async def fetch_entry(self, session: ClientSession, entry_id: int) -> Optional[Dict]:
         """Entry çekme ve işleme"""
-        for attempt in range(MAX_RETRIES):
-            try:
-                async with self.semaphore, self.rate_limiter:
-                    url = f"https://incisozluk.co/e/{entry_id}"
-                    headers = {'User-Agent': random.choice(USER_AGENTS)}
+        while True:  # Sonsuz döngü, başarılı olana kadar veya manuel olarak durdurulana kadar devam eder
+            for attempt in range(MAX_RETRIES):
+                try:
+                    async with self.semaphore, self.rate_limiter:
+                        url = f"https://incisozluk.co/e/{entry_id}"
+                        headers = {'User-Agent': random.choice(USER_AGENTS)}
 
-                    async with session.get(url, headers=headers, timeout=REQUEST_TIMEOUT) as response:
-                        if response.status == 200:
-                            html = await response.text()
-                            data = await parse_html(html, entry_id)
-                            if data:
-                                await self.collection.update_one(
-                                    {"entry_id": entry_id},
-                                    {"$set": data},
-                                    upsert=True
-                                )
-                                logger.info(f"Processed #{entry_id}")
-                            return data
-                        elif response.status == 404:
-                            logger.debug(f"Entry {entry_id} not found")
-                            return None
-                        else:
-                            raise Exception(f"HTTP {response.status}")
-            except Exception as e:
-                logger.warning(f"Attempt {attempt + 1} failed for #{entry_id}: {str(e)}")
-                if attempt < MAX_RETRIES - 1:
-                    await asyncio.sleep((attempt + 1) * 2)  # Backoff
-                else:
-                    logger.error(f"Max retries reached for #{entry_id}")
-                    raise
+                        try:
+                            async with session.get(url, headers=headers, timeout=REQUEST_TIMEOUT) as response:
+                                if response.status == 200:
+                                    html = await response.text()
+                                    data = await parse_html(html, entry_id)
+                                    if data:
+                                        await self.collection.update_one(
+                                            {"entry_id": entry_id},
+                                            {"$set": data},
+                                            upsert=True
+                                        )
+                                        logger.info(f"Processed #{entry_id}")
+                                    return data
+                                elif response.status == 404:
+                                    logger.debug(f"Entry {entry_id} not found")
+                                    return None
+                                else:
+                                    raise Exception(f"HTTP {response.status}")
+                        except asyncio.TimeoutError:
+                            logger.warning(f"Timeout for #{entry_id}, attempt {attempt + 1}/{MAX_RETRIES}")
+                            if attempt < MAX_RETRIES - 1:
+                                await asyncio.sleep((attempt + 1) * 5)  # Artan bekleme süresi
+                            else:
+                                raise
+                except Exception as e:
+                    logger.warning(f"Attempt {attempt + 1} failed for #{entry_id}: {str(e)}")
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep((attempt + 1) * 2)  # Backoff
+                    else:
+                        logger.error(f"Max retries reached for #{entry_id}. Waiting 10 minutes before retrying...")
+                        await asyncio.sleep(600)  # 10 dakika bekle
+                        break
 
     async def run(self):
         """Ana çalıştırıcı"""
