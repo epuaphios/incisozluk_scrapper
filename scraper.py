@@ -1,179 +1,221 @@
-import threading
-import queue
-import requests
-from bs4 import BeautifulSoup
-from pymongo import MongoClient
-import time
+#!/usr/bin/env python3
+import asyncio
+import aiohttp
+import logging
 import random
-from datetime import datetime
+import time
 import unicodedata
+from datetime import datetime
+from typing import Optional, Dict, Any
+from selectolax.parser import HTMLParser
+from motor.motor_asyncio import AsyncIOMotorClient
+from aiohttp import ClientSession, TCPConnector
 
-# MongoDB Ayarları
+# ---------------------------- Config ----------------------------
 MONGO_URI = "mongodb://scraper:scraper123@localhost:27017/incisozluk?authSource=incisozluk"
 DB_NAME = "incisozluk"
 COLLECTION_NAME = "entries"
 
-# Scraper Ayarları
-THREAD_COUNT = 20
-START_ID = 257245
-END_ID = 2000000
-REQUEST_DELAY = 1
-MAX_RETRIES = 10
+CONCURRENT_TASKS = 250  # Eşzamanlı request sayısı
+REQUEST_TIMEOUT = 25
+MAX_RETRIES = 5
+BASE_DELAY = 0.3
+ENTRY_START = 428522
+ENTRY_END = 2000000
+
 USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15'
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3.1 Safari/605.1.15'
 ]
 
-client = MongoClient(MONGO_URI)
-db = client[DB_NAME]
-collection = db[COLLECTION_NAME]
+# ---------------------------- Setup ----------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger('InciScraper')
 
-task_queue = queue.Queue()
-
-def clean_text(text):
-    text = unicodedata.normalize('NFKC', str(text))
+# ---------------------------- Helpers ----------------------------
+def clean_text(text: str) -> str:
+    """Metni normalize etme ve temizleme"""
+    text = unicodedata.normalize('NFKC', text)
     return text.encode('utf-8', 'ignore').decode('utf-8').strip()
 
-def get_wiki_first_comment(slug):
+# ---------------------------- Parser ----------------------------
+async def parse_html(html: str, entry_id: int) -> Optional[Dict[str, Any]]:
     try:
-        headers = {'User-Agent': random.choice(USER_AGENTS)}
-        url = f"https://incisozluk.co/w/{slug}"
-        response = requests.get(url, headers=headers, timeout=15)
+        tree = HTMLParser(html)
 
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.content.decode('utf-8', 'ignore'), 'lxml')
-            first_entry = soup.find('li', class_='entry')
-            if first_entry:
-                entry_div = first_entry.find('div', class_='entry-text-wrap')
-                return clean_text(entry_div.get_text()) if entry_div else ""
-        return ""
-    except Exception as e:
-        print(f"Wiki Çekme Hatası: {str(e)}")
-        return ""
+        # Başlık ve Wiki bilgisi
+        title_tag = tree.css_first('h1.title a')
+        baslik = clean_text(title_tag.text()) if title_tag else ""
+        wiki_slug = title_tag.attrs.get('href', '').split('/w/')[-1] if title_tag else ""
 
-def parse_html(html, entry_id):
-    try:
-        soup = BeautifulSoup(html.decode('utf-8', 'ignore'), 'lxml')
-
-        title_tag = soup.find('h1', class_='title')
-        baslik = ""
-        wiki_slug = ""
-        if title_tag:
-            title_link = title_tag.find('a')
-            if title_link:
-                wiki_slug = title_link.get('href', '').split('/w/')[-1].strip('/')
-                baslik = clean_text(title_link.get_text())
-
-        main_entry = soup.find('li', class_='entry')
+        # Ana entry
+        main_entry = tree.css_first('li.entry')
         if not main_entry:
             return None
 
-        date_tag = main_entry.find('a', class_='entry-tarih')
-        raw_date = date_tag.get('title', '') if date_tag else ""
+        # Tarih
+        date_tag = main_entry.css_first('a.entry-tarih')
+        raw_date = date_tag.attrs.get('title', '') if date_tag else ""
         try:
             parsed_date = datetime.strptime(raw_date, "%d-%m-%Y %H:%M").isoformat()
-        except:
+        except ValueError:
             parsed_date = datetime.now().isoformat()
 
-        upvote = main_entry.find('span', class_='puan_suku')
-        downvote = main_entry.find('span', class_='puan_cuku')
+        # Oylar
+        upvote = main_entry.css_first('span.puan_suku strong')
+        downvote = main_entry.css_first('span.puan_cuku strong')
 
-        baslik_ilk_yorum = get_wiki_first_comment(wiki_slug) if wiki_slug else ""
+        # Başlık ilk yorumu
+        baslik_ilk_yorum = await get_wiki_first_comment(wiki_slug) if wiki_slug else ""
 
         data = {
             "entry_id": entry_id,
             "baslik": baslik,
-            "entry": clean_text(main_entry.find('div', class_='entry-text-wrap').get_text()),
+            "entry": clean_text(main_entry.css_first('div.entry-text-wrap').text()),
             "baslik_ilk_yorum": baslik_ilk_yorum,
             "tarih": parsed_date,
             "entry_oy": {
-                "artı": clean_text(upvote.find('strong').get_text()) if upvote and upvote.find('strong') else "0",
-                "eksi": clean_text(downvote.find('strong').get_text()) if downvote and downvote.find('strong') else "0"
+                "artı": clean_text(upvote.text()) if upvote else "0",
+                "eksi": clean_text(downvote.text()) if downvote else "0"
             },
             "entry_cevaplar": []
         }
 
-        reply_section = main_entry.find_next_sibling('li', class_='replay')
+        # Cevaplar
+        reply_section = main_entry.next
+        while reply_section and not reply_section.css_matches('li.replay'):
+            reply_section = reply_section.next
+
         if reply_section:
-            for reply in reply_section.find_all('li', class_='entry'):
-                reply_text = reply.find('div', class_='entry-text-wrap')
-                reply_upvote = reply.find('span', class_='puan_suku')
-                reply_downvote = reply.find('span', class_='puan_cuku')
+            for reply in reply_section.css('li.entry'):
+                reply_text = reply.css_first('div.entry-text-wrap')
+                reply_up = reply.css_first('span.puan_suku strong')
+                reply_down = reply.css_first('span.puan_cuku strong')
 
                 data["entry_cevaplar"].append({
-                    "entry": clean_text(reply_text.get_text()) if reply_text else "",
+                    "entry": clean_text(reply_text.text()) if reply_text else "",
                     "oy": {
-                        "artı": clean_text(reply_upvote.find('strong').get_text()) if reply_upvote and reply_upvote.find('strong') else "0",
-                        "eksi": clean_text(reply_downvote.find('strong').get_text()) if reply_downvote and reply_downvote.find('strong') else "0"
+                        "artı": clean_text(reply_up.text()) if reply_up else "0",
+                        "eksi": clean_text(reply_down.text()) if reply_down else "0"
                     }
                 })
 
         return data
-
     except Exception as e:
-        print(f"Parse Hatası: {str(e)}")
+        logger.error(f"Parse error #{entry_id}: {str(e)}")
         return None
 
-def worker():
-    while True:
-        entry_id = task_queue.get()
-        retry_count = 0
-        success = False
+async def get_wiki_first_comment(slug: str) -> str:
+    """Wiki ilk yorumu çekme"""
+    try:
+        headers = {'User-Agent': random.choice(USER_AGENTS)}
+        url = f"https://incisozluk.co/w/{slug}"
 
-        while retry_count < MAX_RETRIES and not success:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=15) as response:
+                if response.status == 200:
+                    html = await response.text()
+                    tree = HTMLParser(html)
+                    first_entry = tree.css_first('li.entry div.entry-text-wrap')
+                    return clean_text(first_entry.text()) if first_entry else ""
+                return ""
+    except Exception as e:
+        logger.error(f"Wiki error: {str(e)}")
+        return ""
+
+# ---------------------------- Scraper Core ----------------------------
+class InciScraper:
+    def __init__(self):
+        self.semaphore = asyncio.Semaphore(CONCURRENT_TASKS)
+        self.rate_limiter = RateLimiter(requests_per_second=100)
+        self.client = AsyncIOMotorClient(MONGO_URI)
+        self.collection = self.client[DB_NAME][COLLECTION_NAME]
+
+    async def fetch_entry(self, session: ClientSession, entry_id: int) -> Optional[Dict]:
+        """Entry çekme ve işleme"""
+        for attempt in range(MAX_RETRIES):
             try:
-                headers = {'User-Agent': random.choice(USER_AGENTS)}
-                delay = REQUEST_DELAY * random.uniform(0.8, 1.2)
-                time.sleep(delay)
+                async with self.semaphore, self.rate_limiter:
+                    url = f"https://incisozluk.co/e/{entry_id}"
+                    headers = {'User-Agent': random.choice(USER_AGENTS)}
 
-                url = f"https://incisozluk.co/e/{entry_id}"
-                response = requests.get(url, headers=headers, timeout=15)
-
-                if response.status_code == 200:
-                    try:
-                        data = parse_html(response.content, entry_id)
-                    except Exception as e:
-                        print(f"⚠️ #{entry_id} ayrıştırma hatası: {str(e)}")
-                        data = None
-
-                    if data:
-                        collection.update_one(
-                            {"entry_id": entry_id},
-                            {"$set": data},
-                            upsert=True
-                        )
-                        print(f"✅ #{entry_id} kaydedildi - İlk yorum: {data['baslik_ilk_yorum'][:30]}...")
-                    success = True
-                elif response.status_code == 404:
-                    print(f"⏩ #{entry_id} bulunamadı")
-                    success = True
-                else:
-                    print(f"⚠️ #{entry_id} hata: {response.status_code}, yeniden deneme {retry_count + 1}/{MAX_RETRIES}")
-                    retry_count += 1
-
+                    async with session.get(url, headers=headers, timeout=REQUEST_TIMEOUT) as response:
+                        if response.status == 200:
+                            html = await response.text()
+                            data = await parse_html(html, entry_id)
+                            if data:
+                                await self.collection.update_one(
+                                    {"entry_id": entry_id},
+                                    {"$set": data},
+                                    upsert=True
+                                )
+                                logger.info(f"Processed #{entry_id}")
+                            return data
+                        elif response.status == 404:
+                            logger.debug(f"Entry {entry_id} not found")
+                            return None
+                        else:
+                            raise Exception(f"HTTP {response.status}")
             except Exception as e:
-                print(f"🔥 #{entry_id} hata: {str(e)}, yeniden deneme {retry_count + 1}/{MAX_RETRIES}")
-                retry_count += 1
+                logger.warning(f"Attempt {attempt + 1} failed for #{entry_id}: {str(e)}")
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep((attempt + 1) * 2)  # Backoff
+                else:
+                    logger.error(f"Max retries reached for #{entry_id}")
+                    raise
 
-            if not success and retry_count < MAX_RETRIES:
-                backoff = 5 * retry_count
-                time.sleep(backoff)
+    async def run(self):
+        """Ana çalıştırıcı"""
+        connector = TCPConnector(limit=0, ssl=False)
+        async with ClientSession(connector=connector) as session:
+            tasks = []
+            for entry_id in range(ENTRY_START, ENTRY_END + 1):
+                task = asyncio.create_task(self.fetch_entry(session, entry_id))
+                tasks.append(task)
+                if len(tasks) >= CONCURRENT_TASKS * 2:
+                    await asyncio.gather(*tasks)
+                    tasks = []
+                    logger.info(f"Progress: {entry_id}/{ENTRY_END}")
+            await asyncio.gather(*tasks)
 
-        if not success:
-            print(f"🚨 #{entry_id} 10 kez denenmesine rağmen alınamadı. 10 dakika bekleniyor...")
-            time.sleep(600)
+# ---------------------------- Rate Limiter ----------------------------
+class RateLimiter:
+    """Dinamik rate limiter"""
+    def __init__(self, requests_per_second: int):
+        self.rate = requests_per_second
+        self.tokens = requests_per_second
+        self.last_update = time.monotonic()
 
-        task_queue.task_done()
+    async def __aenter__(self):
+        """Asenkron context manager girişi"""
+        while self.tokens <= 0:
+            self._add_tokens()
+            await asyncio.sleep(0.1)
+        self.tokens -= 1
+        return self
 
-# Thread'leri Başlat
-for _ in range(THREAD_COUNT):
-    threading.Thread(target=worker, daemon=True).start()
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Asenkron context manager çıkışı"""
+        pass  # Herhangi bir temizlik yapmaya gerek yok
 
-# Queue'yu Doldur
-for entry_id in range(START_ID, END_ID + 1):
-    task_queue.put(entry_id)
+    def _add_tokens(self):
+        """Yeni token'lar ekleme"""
+        now = time.monotonic()
+        elapsed = now - self.last_update
+        new_tokens = elapsed * self.rate
+        self.tokens = min(self.rate, self.tokens + new_tokens)
+        self.last_update = now
 
-# Bekleme ve Temizlik
-task_queue.join()
-client.close()
-print("🎉 İşlem tamamlandı!")
+# ---------------------------- Main ----------------------------
+if __name__ == "__main__":
+    scraper = InciScraper()
+    try:
+        asyncio.run(scraper.run())
+    except KeyboardInterrupt:
+        logger.info("Scraper stopped by user")
+    finally:
+        scraper.client.close()
