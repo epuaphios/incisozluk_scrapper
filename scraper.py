@@ -12,7 +12,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from aiohttp import ClientSession, TCPConnector
 
 # ---------------------------- Config ----------------------------
-MONGO_URI = "mongodb://scraper:scraper123@localhost:27017/incisozluk?authSource=incisozluk"
+MONGO_URI = "mongodb://scraper:scraper123@192.168.2.105:27017/incisozluk?authSource=incisozluk"
 DB_NAME = "incisozluk"
 COLLECTION_NAME = "entries"
 
@@ -20,8 +20,8 @@ CONCURRENT_TASKS = 250  # Eşzamanlı request sayısı
 REQUEST_TIMEOUT = 25
 MAX_RETRIES = 15
 BASE_DELAY = 0.3
-ENTRY_START = 428522
-ENTRY_END = 2000000
+ENTRY_START = 3500000
+ENTRY_END = 3500002
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -42,9 +42,21 @@ def clean_text(text: str) -> str:
     text = unicodedata.normalize('NFKC', text)
     return text.encode('utf-8', 'ignore').decode('utf-8').strip()
 
+import uuid
+
+def generate_random_cookies():
+    # Rastgele çerez adı ve değeri oluştur
+    cookie_name = f"cookie_{uuid.uuid4().hex[:6]}"
+    cookie_value = uuid.uuid4().hex
+    return f"{cookie_name}={cookie_value}"
+
 # ---------------------------- Parser ----------------------------
 async def parse_html(html: str, entry_id: int) -> Optional[Dict[str, Any]]:
     try:
+        if not html:  # HTML boşsa
+            logger.warning(f"Empty HTML for #{entry_id}. Skipping...")
+            return None  # İşlemi durdur
+
         tree = HTMLParser(html)
 
         # Başlık ve Wiki bilgisi
@@ -108,17 +120,25 @@ async def parse_html(html: str, entry_id: int) -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.error(f"Parse error #{entry_id}: {str(e)}")
         return None
-
 async def get_wiki_first_comment(slug: str) -> str:
     """Wiki ilk yorumu çekme"""
     try:
-        headers = {'User-Agent': random.choice(USER_AGENTS)}
+        headers = {
+            'User-Agent': random.choice(USER_AGENTS),
+            'Cookie': generate_random_cookies(),  # Rastgele çerezler
+            'Referer': 'https://incisozluk.co/',
+            'Accept-Language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
+        }
         url = f"https://incisozluk.co/w/{slug}"
 
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers, timeout=15) as response:
                 if response.status == 200:
                     html = await response.text()
+                    if not html:  # HTML boşsa
+                        logger.warning(f"Empty HTML for wiki slug: {slug}. Skipping...")
+                        return ""  # İşlemi durdur
+
                     tree = HTMLParser(html)
                     first_entry = tree.css_first('li.entry div.entry-text-wrap')
                     return clean_text(first_entry.text()) if first_entry else ""
@@ -126,7 +146,6 @@ async def get_wiki_first_comment(slug: str) -> str:
     except Exception as e:
         logger.error(f"Wiki error: {str(e)}")
         return ""
-
 # ---------------------------- Scraper Core ----------------------------
 class InciScraper:
     def __init__(self):
@@ -142,12 +161,21 @@ class InciScraper:
                 try:
                     async with self.semaphore, self.rate_limiter:
                         url = f"https://incisozluk.co/e/{entry_id}"
-                        headers = {'User-Agent': random.choice(USER_AGENTS)}
+                        headers = {
+                            'User-Agent': random.choice(USER_AGENTS),
+                            'Cookie': generate_random_cookies(),  # Rastgele çerezler
+                            'Referer': 'https://incisozluk.co/',
+                            'Accept-Language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
+                        }
 
                         try:
                             async with session.get(url, headers=headers, timeout=REQUEST_TIMEOUT) as response:
                                 if response.status == 200:
                                     html = await response.text()
+                                    if not html:  # HTML boşsa
+                                        logger.warning(f"Empty HTML for #{entry_id}. Skipping...")
+                                        return None  # İşlemi durdur
+
                                     data = await parse_html(html, entry_id)
                                     if data:
                                         await self.collection.update_one(
@@ -176,7 +204,6 @@ class InciScraper:
                         logger.error(f"Max retries reached for #{entry_id}. Waiting 10 minutes before retrying...")
                         await asyncio.sleep(600)  # 10 dakika bekle
                         break
-
     async def run(self):
         """Ana çalıştırıcı"""
         connector = TCPConnector(limit=0, ssl=False)
