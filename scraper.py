@@ -10,7 +10,7 @@ MONGO_URI = "mongodb://scraper:scraper123@192.168.1.117:27017/incisozluk?authSou
 DB_NAME = "incisozluk"
 COLLECTION_NAME = "entries"
 
-CONCURRENT_TASKS = 250  # Eşzamanlı request sayısı
+CONCURRENT_TASKS = 100  # Eşzamanlı request sayısı
 REQUEST_TIMEOUT = 25
 MAX_RETRIES = 15
 BASE_DELAY = 0.3
