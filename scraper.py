@@ -12,7 +12,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from aiohttp import ClientSession, TCPConnector
 
 # ---------------------------- Config ----------------------------
-MONGO_URI = "mongodb://scraper:scraper123@192.168.2.105:27017/incisozluk?authSource=incisozluk"
+MONGO_URI = "mongodb://scraper:scraper123@192.168.1.117:27017/incisozluk?authSource=incisozluk"
 DB_NAME = "incisozluk"
 COLLECTION_NAME = "entries"
 
@@ -20,8 +20,8 @@ CONCURRENT_TASKS = 250  # Eşzamanlı request sayısı
 REQUEST_TIMEOUT = 25
 MAX_RETRIES = 15
 BASE_DELAY = 0.3
-ENTRY_START = 3500000
-ENTRY_END = 3500002
+ENTRY_START = 11729109
+ENTRY_END = 20000000
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
