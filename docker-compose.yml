@@ -11,6 +11,6 @@ services:
     ports:
       - "27017:27017"
     volumes:
-      - /media/ogn/data/mongo-data:/data/db
-      - /media/ogn/data/mongo-init:/docker-entrypoint-initdb.d
+      - /media/ogn/data1/mongo-data:/data/db
+      - /media/ogn/data1/mongo-init:/docker-entrypoint-initdb.d
     command: [--wiredTigerCacheSizeGB=4] # RAM'de 1GB cache kullan (sunucu boyutuna göre ayarla)
